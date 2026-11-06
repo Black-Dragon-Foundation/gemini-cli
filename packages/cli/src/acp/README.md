@@ -23,6 +23,10 @@ consistency:
 - **[acpSession.ts](./acpSession.ts)**: Manages individual active chat sessions.
   It handles prompt execution, `@path` file resolution, tool execution, command
   interception, and streaming updates back to the client.
+- **[acpDrgnxPanel.ts](./acpDrgnxPanel.ts)**: The `_drgnx/panel` extension
+  (drgnx's editor panel): capability negotiation, the context breakdown, drop,
+  and the `_drgnx/before_tool` answer check. It is advertised only to a client
+  that sent `_meta["_drgnx/panel"].version == 1`.
 - **[acpUtils.ts](./acpUtils.ts)**: Contains shared helper functions, type
   mappers (e.g., mapping internal tool kinds to ACP kinds), and Zod schemas used
   across the modules.

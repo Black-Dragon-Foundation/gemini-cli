@@ -57,6 +57,13 @@ import {
 } from './acpUtils.js';
 import { z } from 'zod';
 import { getAcpErrorMessage } from './acpErrors.js';
+import {
+  DRGNX_BEFORE_TOOL_METHOD,
+  DRGNX_CONTEXT_METHOD,
+  buildContext,
+  dropExchange,
+  readBeforeToolAnswer,
+} from './acpDrgnxPanel.js';
 
 const StructuredErrorSchema = z.object({
   status: z.number().optional(),
@@ -65,6 +72,7 @@ const StructuredErrorSchema = z.object({
 
 export class Session {
   private pendingPrompt: AbortController | null = null;
+  private activeTurns = 0;
   private commandHandler = new CommandHandler();
   private callIdCounter = 0;
   private readonly disposeController = new AbortController();
@@ -79,6 +87,7 @@ export class Session {
     private readonly context: AgentLoopContext,
     private readonly connection: acp.AgentSideConnection,
     private readonly settings: LoadedSettings,
+    private readonly panelFeatures: readonly string[] = [],
   ) {
     coreEvents.on(
       CoreEvent.ApprovalModeChanged,
@@ -145,6 +154,33 @@ export class Session {
           requiresUserConfirmation: false,
         });
         return;
+      }
+
+      // A subagent's tool calls never reach runTool: this is where they are
+      // checked, so drgnx is asked here, failing closed like in runTool.
+      if (request.subagent) {
+        let refusal: string | undefined;
+        try {
+          await this.askDrgnxBeforeTool(
+            request.toolCall.id ?? request.correlationId,
+            toolName,
+            request.toolCall.args ?? {},
+          );
+        } catch (error) {
+          refusal = getErrorMessage(error);
+        }
+        if (refusal !== undefined) {
+          debugLogger.warn(
+            `drgnx refused ${toolName} of subagent ${request.subagent}: ${refusal}`,
+          );
+          await messageBus.publish({
+            type: MessageBusType.TOOL_CONFIRMATION_RESPONSE,
+            correlationId: request.correlationId,
+            confirmed: false,
+            requiresUserConfirmation: false,
+          });
+          return;
+        }
       }
 
       const serverName =
@@ -317,6 +353,17 @@ export class Session {
   }
 
   async prompt(params: acp.PromptRequest): Promise<acp.PromptResponse> {
+    this.activeTurns++;
+    try {
+      return await this.runPrompt(params);
+    } finally {
+      this.activeTurns--;
+    }
+  }
+
+  private async runPrompt(
+    params: acp.PromptRequest,
+  ): Promise<acp.PromptResponse> {
     this.pendingPrompt?.abort();
     const pendingSend = new AbortController();
     this.pendingPrompt = pendingSend;
@@ -574,6 +621,7 @@ export class Session {
       totalThoughtTokens += turnThoughtTokens;
 
       if (turnInputTokens > 0 || turnOutputTokens > 0) {
+        await this.sendDrgnxContext(turnModelId);
         const existing = modelUsageMap.get(turnModelId) ?? {
           input: 0,
           output: 0,
@@ -639,6 +687,108 @@ export class Session {
     await this.connection.sessionUpdate(params);
   }
 
+  /**
+   * Asks the client `_drgnx/before_tool` before the tool's confirmation. Only an exact allow
+   * continues; a deny, a failed request or an unreadable answer throws, which ends the tool
+   * with that error. An allow grants nothing: the confirmation still runs.
+   */
+  private async askDrgnxBeforeTool(
+    callId: string,
+    name: string,
+    args: Record<string, unknown>,
+    abortSignal?: AbortSignal,
+  ): Promise<void> {
+    if (!this.panelFeatures.includes('before-tool')) return;
+    let answer;
+    try {
+      answer = readBeforeToolAnswer(
+        await this.connection.extMethod(DRGNX_BEFORE_TOOL_METHOD, {
+          sessionId: this.id,
+          toolCall: {
+            toolCallId: callId,
+            title: name,
+            rawInput: args,
+            _meta: { 'gemini-cli': { toolName: name } },
+          },
+        }),
+      );
+    } catch (error) {
+      if (abortSignal?.aborted) throw error;
+      throw new Error(
+        `drgnx could not be asked before the tool ran: ${getErrorMessage(error)}`,
+      );
+    }
+    if (!answer.allow) throw new Error(answer.reason);
+  }
+
+  /** Sends `_drgnx/context` for the session. Errors are logged, never thrown. */
+  private async sendDrgnxContext(modelId: string): Promise<void> {
+    if (!this.panelFeatures.includes('context')) return;
+    try {
+      await this.connection.extNotification(DRGNX_CONTEXT_METHOD, {
+        sessionId: this.id,
+        ...buildContext({
+          turns: this.chat.getHistoryTurns(),
+          systemInstruction: this.chat.getSystemInstruction(),
+          tools: this.chat.getTools(),
+          lastPromptTokens: this.chat.getLastPromptTokenCount(),
+          size: tokenLimit(modelId || this.context.config.getModel()),
+        }),
+      });
+    } catch (error) {
+      debugLogger.error(
+        `Session ${this.id}: failed to send the context breakdown: ${error}`,
+      );
+    }
+  }
+
+  /** `_drgnx/context/drop`: removes one exchange from the history, then sends the new breakdown. */
+  async dropContextItem(item: unknown): Promise<Record<string, never>> {
+    if (this.activeTurns > 0) {
+      throw new acp.RequestError(
+        -32000,
+        'A turn is running; drop after it ends.',
+      );
+    }
+    const kept = dropExchange(this.chat.getHistoryTurns(), item);
+    if (!kept) {
+      throw new acp.RequestError(-32602, 'No such item in the context.');
+    }
+    this.chat.setHistory(kept);
+    await this.sendDrgnxContext(this.context.config.getModel());
+    return {};
+  }
+
+  /**
+   * `_drgnx/compact/preview`: runs the compaction's summary and reports what it would free;
+   * nothing is applied. Gemini's compaction is a summary call and a check call, and
+   * the preview says so.
+   */
+  async previewCompaction(): Promise<{ frees?: number; note: string }> {
+    if (this.activeTurns > 0) {
+      throw new acp.RequestError(
+        -32000,
+        'A turn is running; preview after it ends.',
+      );
+    }
+    const { newHistory, info } =
+      await this.context.geminiClient.previewCompression(
+        `${this.id}-drgnx-preview`,
+      );
+    const cost =
+      "Costs model calls (a summary and a check); nothing is compacted. The count is Gemini's.";
+    if (!newHistory) {
+      return {
+        frees: 0,
+        note: `A compaction would change nothing now (${info.compressionStatus}). ${cost}`,
+      };
+    }
+    return {
+      frees: Math.max(info.originalTokenCount - info.newTokenCount, 0),
+      note: cost,
+    };
+  }
+
   private async runTool(
     abortSignal: AbortSignal,
     promptId: string,
@@ -693,6 +843,8 @@ export class Session {
 
     try {
       const invocation = tool.build(args);
+
+      await this.askDrgnxBeforeTool(callId, fc.name, args, abortSignal);
 
       const displayTitle =
         typeof invocation.getDisplayTitle === 'function'
