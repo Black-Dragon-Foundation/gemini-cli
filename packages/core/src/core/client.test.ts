@@ -730,6 +730,33 @@ describe('Gemini Client (client.ts)', () => {
       });
     });
 
+    it('previews a compression without applying it', async () => {
+      const { client, mockOriginalChat } = setup({
+        originalTokenCount: 900,
+        newTokenCount: 300,
+        compressionStatus: CompressionStatus.COMPRESSED,
+      });
+      const chatBefore = client.getChat();
+
+      const { newHistory, info } = await client.previewCompression('preview');
+
+      expect(ChatCompressionService.prototype.compress).toHaveBeenCalledWith(
+        chatBefore,
+        'preview',
+        true,
+        expect.any(String),
+        expect.anything(),
+        false,
+        undefined,
+      );
+      expect(newHistory).not.toBeNull();
+      expect(info.originalTokenCount).toBe(900);
+      expect(info.newTokenCount).toBe(300);
+      expect(client.getChat()).toBe(chatBefore);
+      expect(mockOriginalChat.setHistory).not.toHaveBeenCalled();
+      expect(client['startChat']).not.toHaveBeenCalled();
+    });
+
     it('should resume the session file when compression succeeds', async () => {
       const { client, mockOriginalChat } = setup({
         compressionStatus: CompressionStatus.COMPRESSED,

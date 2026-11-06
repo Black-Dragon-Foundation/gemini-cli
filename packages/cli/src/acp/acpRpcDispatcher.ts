@@ -17,12 +17,21 @@ import type { CliArgs } from '../config/config.js';
 import { getAcpErrorMessage } from './acpErrors.js';
 import { AcpSessionManager, type AuthDetails } from './acpSessionManager.js';
 import { hasMeta } from './acpUtils.js';
+import {
+  DRGNX_COMPACT_PREVIEW_METHOD,
+  DRGNX_DROP_METHOD,
+  DRGNX_PANEL_KEY,
+  adminPolicyFileNames,
+  adminPolicyStatus,
+  panelCapability,
+} from './acpDrgnxPanel.js';
 
 export class GeminiAgent {
   private apiKey: string | undefined;
   private baseUrl: string | undefined;
   private customHeaders: Record<string, string> | undefined;
   private sessionManager: AcpSessionManager;
+  private adminPolicyPaths: string[] | undefined;
 
   constructor(
     private context: AgentLoopContext,
@@ -31,6 +40,8 @@ export class GeminiAgent {
     connection: acp.AgentSideConnection,
   ) {
     this.sessionManager = new AcpSessionManager(settings, argv, connection);
+    this.adminPolicyPaths =
+      argv.adminPolicy ?? settings.merged?.adminPolicyPaths;
   }
 
   async dispose(): Promise<void> {
@@ -79,6 +90,16 @@ export class GeminiAgent {
     ];
 
     await this.context.config.initialize();
+    // The admin policy is read from the engine, which has its rules by now.
+    const panel = panelCapability(args.clientCapabilities)
+      ? panelCapability(
+          args.clientCapabilities,
+          adminPolicyStatus(
+            await adminPolicyFileNames(this.adminPolicyPaths),
+            this.context.config.getPolicyEngine?.()?.getRules() ?? [],
+          ),
+        )
+      : undefined;
     const version = await getVersion();
     return {
       protocolVersion: acp.PROTOCOL_VERSION,
@@ -99,8 +120,39 @@ export class GeminiAgent {
           http: true,
           sse: true,
         },
+        ...(panel ? { _meta: { [DRGNX_PANEL_KEY]: panel } } : {}),
       },
     };
+  }
+
+  /**
+   * Extension methods. Only the `_drgnx/panel` methods the client negotiated are served;
+   * anything else is method-not-found.
+   */
+  async extMethod(
+    method: string,
+    params: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    const features = this.sessionManager.getPanelFeatures();
+    const feature = {
+      [DRGNX_DROP_METHOD]: 'drop',
+      [DRGNX_COMPACT_PREVIEW_METHOD]: 'compact-preview',
+    }[method];
+    if (!feature || !features.includes(feature)) {
+      throw acp.RequestError.methodNotFound(method);
+    }
+    const sessionId = params['sessionId'];
+    const session =
+      typeof sessionId === 'string'
+        ? this.sessionManager.getSession(sessionId)
+        : undefined;
+    if (!session) {
+      throw new acp.RequestError(-32602, `Session not found: ${sessionId}`);
+    }
+    if (method === DRGNX_DROP_METHOD) {
+      return session.dropContextItem(params['item']);
+    }
+    return session.previewCompaction();
   }
 
   async authenticate(req: acp.AuthenticateRequest): Promise<void> {

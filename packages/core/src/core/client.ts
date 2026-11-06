@@ -1282,6 +1282,26 @@ export class GeminiClient {
   }
 
   /**
+   * Runs a forced compression and returns its result without applying it: the
+   * chat and its history stay as they are. It makes the same model calls as a
+   * real compression.
+   */
+  async previewCompression(
+    prompt_id: string,
+    abortSignal?: AbortSignal,
+  ): Promise<{ newHistory: Content[] | null; info: ChatCompressionInfo }> {
+    return this.compressionService.compress(
+      this.getChat(),
+      prompt_id,
+      true,
+      this._getActiveModelForCurrentTurn(),
+      this.config,
+      this.hasFailedCompressionAttempt,
+      abortSignal,
+    );
+  }
+
+  /**
    * Masks bulky tool outputs to save context window space.
    */
   private async tryMaskToolOutputs(history: readonly Content[]): Promise<void> {
