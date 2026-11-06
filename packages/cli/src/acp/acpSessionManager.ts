@@ -21,6 +21,7 @@ import { SessionSelector } from '../utils/sessionUtils.js';
 import { Session } from './acpSession.js';
 import { AcpFileSystemService } from './acpFileSystemService.js';
 import { getAcpErrorMessage } from './acpErrors.js';
+import { panelCapability } from './acpDrgnxPanel.js';
 import { buildAvailableModels, buildAvailableModes } from './acpUtils.js';
 import { loadCliConfig, type CliArgs } from '../config/config.js';
 import { startAutoMemoryIfEnabled } from '../utils/autoMemory.js';
@@ -43,6 +44,11 @@ export class AcpSessionManager {
 
   setClientCapabilities(capabilities: acp.ClientCapabilities) {
     this.clientCapabilities = capabilities;
+  }
+
+  /** The `_drgnx/panel` features this connection negotiated, none unless the client sent version 1. */
+  getPanelFeatures(): string[] {
+    return panelCapability(this.clientCapabilities)?.features ?? [];
   }
 
   getSession(sessionId: string): Session | undefined {
@@ -151,6 +157,7 @@ export class AcpSessionManager {
         config,
         this.connection,
         this.settings,
+        this.getPanelFeatures(),
       );
       this.sessions.set(sessionId, session);
 
@@ -260,6 +267,7 @@ export class AcpSessionManager {
         config,
         this.connection,
         this.settings,
+        this.getPanelFeatures(),
       );
 
       this.sessions.set(sessionId, session);
